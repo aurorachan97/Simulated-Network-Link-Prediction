@@ -1,0 +1,332 @@
+---
+title: "ST5225 Project Codes"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sand)
+library(ergm)
+library(dplyr)
+library(linkprediction)
+```
+
+### Generate graph and network
+
+```{r graph}
+# Generate link probabilities and adjacency matrix of graph
+set.seed(1)
+x <- rnorm(100)
+y <- runif(100)
+p.mat <- matrix(0, nrow=100,ncol=100)
+g.mat <- matrix(0, nrow=100,ncol=100)
+
+for(i in 1:99) {
+  for(j in (i+1):100) {
+    p.mat[i,j] <- y[i]*y[j]*exp(-abs(x[i]-x[j]))
+    p.mat[j,i] <- y[i]*y[j]*exp(-abs(x[i]-x[j]))
+    
+    g.mat[i,j] <- (runif(1)<p.mat[i,j])
+    g.mat[j,i] <- (runif(1)<p.mat[i,j])
+  }
+}
+
+# Remove unconnected nodes
+graph <- graph_from_adjacency_matrix(g.mat, mode="undirected")
+plot(graph, layout=layout_with_kk)
+remove_indexes <- which(degree(graph)==0)
+graph <- delete_vertices(graph, remove_indexes)
+x <- x[-remove_indexes]
+y <- y[-remove_indexes]
+p.mat <- p.mat[-remove_indexes, -remove_indexes]
+g.mat <- g.mat[-remove_indexes, -remove_indexes]
+
+# Attach attributes to graph
+graph <- set_vertex_attr(graph, "x", index=V(graph), x)
+graph <- set_vertex_attr(graph, "y", index=V(graph), y)
+
+# Get network for modelling
+network <- network::as.network(as.matrix(g.mat), directed=FALSE)
+network::set.vertex.attribute(network, "x", V(graph)$x)
+network::set.vertex.attribute(network, "y", V(graph)$y)
+```
+
+### Data Exploration
+
+```{r explore}
+# Descriptive analysis of network
+vcount(graph)
+ecount(graph)
+degree(graph)
+summary(degree(graph)) # high degree 16.49485
+hist(degree(graph), xlab="Degree", main="")
+knn(graph)$knn
+summary(knn(graph)$knn)
+plot(degree(graph), knn(graph)$knn, xlab="Degree", ylab="Average neighbour degree", ylim=c(0,40)) # No evidence of preferential attachment
+
+# Network cohesion
+edge_density(graph) # relatively sparse 0.1718213
+mean_distance(graph) # small 1.991194
+diameter(graph) # 4 # likely small world effect
+
+transitivity(graph) # high clustering 0.3081091
+mean(transitivity(graph, type="local"), na.rm=TRUE) # similar to global cc 0.3052194
+
+table(sapply(cliques(graph), length)) # high number of cliques of 3-4
+
+# Understand homophily for degree and attribute
+assortativity_degree(graph, directed=FALSE) # low 0.008532938
+assortativity(graph, types1=x, directed=FALSE) # high 0.3579757
+assortativity(graph, types1=y, directed=FALSE) # relatively low 0.06812101
+
+# Create subgraph for visualisation -  find node with largest and median neighbourhood
+node_neighbours_length <- sapply(ego(graph), length)
+which(node_neighbours_length == max(node_neighbours_length)) # 19
+which(node_neighbours_length == median(node_neighbours_length)) # 9 44 58
+max_neighour_graph <- make_ego_graph(graph)[[19]]
+med_neighour_graph <- make_ego_graph(graph)[[9]]
+
+# Visualise relationship of degree and x attribute
+V(max_neighour_graph)$size <- abs(V(max_neighour_graph)$x)*12
+V(max_neighour_graph)$color <- "orange"
+V(max_neighour_graph)$color[which(degree(max_neighour_graph) > 12)] <- "gold"
+plot(max_neighour_graph, layout=layout_with_kk, 
+     main="Relationship between x and degree",
+     sub="Max neighbours") # No evidence of larger x larger degree
+legend("bottomright", inset=.02, title="Degree", 
+       c("<=12",">12"), fill=c("orange","gold"), horiz=TRUE, cex=0.8, bty="n")
+
+V(med_neighour_graph)$size <- abs(V(med_neighour_graph)$x)*12
+V(med_neighour_graph)$color <- "orange"
+V(med_neighour_graph)$color[which(degree(med_neighour_graph) > 6)] <- "gold"
+plot(med_neighour_graph, layout=layout_with_kk,
+     main="Relationship between x and degree",
+     sub="Median neighbours") # Hints possibility of kstar
+legend("bottomright", inset=.02, title="Degree", 
+       c("<=12",">12"), fill=c("orange","gold"), horiz=TRUE, cex=0.8, bty="n")
+
+# Visualise relationship of degree and y attribute
+V(max_neighour_graph)$size <- (V(max_neighour_graph)$y)*15
+V(max_neighour_graph)$color <- "orange"
+V(max_neighour_graph)$color[which(degree(max_neighour_graph) > 12)] <- "gold"
+plot(max_neighour_graph, layout=layout_with_kk, 
+     main="Relationship between y and degree",
+     sub="Max neighbours") # Larger y larger degree
+legend("bottomright", inset=.02, title="Degree", 
+       c("<=12",">12"), fill=c("orange","gold"), horiz=TRUE, cex=0.8, bty="n")
+
+V(med_neighour_graph)$size <- (V(med_neighour_graph)$y)*15
+V(med_neighour_graph)$color <- "orange"
+V(med_neighour_graph)$color[which(degree(med_neighour_graph) > 6)] <- "gold"
+plot(med_neighour_graph, layout=layout_with_kk,
+     main="Relationship between y and degree",
+     sub="Median neighbours") # Hints possibility of kstar
+legend("bottomright", inset=.02, title="Degree", 
+       c("<=12",">12"), fill=c("orange","gold"), horiz=TRUE, cex=0.8, bty="n")
+```
+
+### Prediction scores
+
+```{r scoring}
+# Create table to obtain actual prediction link probabilities of node pairs
+similarity_table <- function(scores) {
+  # Remove duplicate node pairs by making their scores 0
+  for (i in 1:96) {
+    for (j in i:97) {
+      scores[i,j] <- 0
+    }
+  }
+  scores[97,97] <- 0
+  
+  # Process scores into table format
+  index <- which(scores > 0)
+  node_u <- which(scores > 0) %% 97
+  node_u <- ifelse(node_u==0, 97, node_u)
+  node_v <- (floor(which(scores > 0) / 97)) + 1
+  node_v <- ifelse(node_u==97, node_v-1, node_v)
+  table <- cbind.data.frame(node_u, node_v) %>%
+    mutate(score = 0, p_uv = 0, a_uv = 0)
+  
+  # Add actual prediction link probabilities and adjacency of corresponding node pairs
+  for (i in 1:length(index)) {
+    table$score[i] <- scores[node_u[i], node_v[i]]
+    table$a_uv[i] <- g.mat[node_u[i], node_v[i]]
+    table$p_uv[i] <- p.mat[node_u[i], node_v[i]]
+  }
+  
+  return(table)
+}
+
+# Common neighbours
+common_neighbour_scores <- proxfun(graph, method="cn")
+common_neighbour_table <- similarity_table(common_neighbour_scores) %>% 
+    rename(common_neighbour=score) 
+
+# Obtain top 10 node pairs of common neighbour scores and evaluate performance
+(common_neighbour_top10 <- common_neighbour_table %>% 
+    arrange(desc(common_neighbour)) %>% 
+    head(20))
+# Correct for the 10 ties in the last position
+(sum(common_neighbour_top10$p_uv[1:9])+sum(common_neighbour_top10$p_uv[10:19])/10)/10 # 0.51752
+
+# Jaccard measure
+jaccard_scores <- proxfun(graph, method="jaccard")
+jaccard_table <- similarity_table(jaccard_scores) %>% 
+    rename(jaccard=score)
+
+# Obtain top 10 node pairs of similarity scores and evaluate performance
+(jaccard_top10 <- jaccard_table  %>% 
+    arrange(desc(jaccard)) %>% 
+    head(20))
+mean(jaccard_top10$p_uv[1:10]) # 0.4837893
+
+# Preferential attachment
+preferential_scores <- proxfun(graph, method="pa")
+preferential_table <- similarity_table(preferential_scores) %>% 
+    rename(preferential=score)
+
+# Obtain top 10 node pairs of preferential scores and evaluate performance
+(preferential_top10 <- preferential_table %>% 
+    arrange(desc(preferential)) %>% 
+    head(20))
+# Correct for the 6 ties in the last 2 positions
+(sum(preferential_top10$p_uv[1:8])+sum(preferential_top10$p_uv[9:14])/3)/10 # 0.4806051
+```
+
+### Create table to compare predicted and actual prediction link probabilities
+
+```{r compare}
+# Function to create comparison table 
+create_table <-  function(model) {
+  predict <- predict(model) %>%
+    rename(node_u = head, node_v = tail, p_uv_hat = p) %>%
+    arrange(desc(p_uv_hat)) %>%
+    mutate(p_uv = 0, a_uv = 0) %>%
+    select(node_u, node_v, p_uv_hat, p_uv, a_uv)
+  
+  for (i in 1:nrow(predict)) {
+    predict$p_uv[i] <- p.mat[predict$node_u[i], predict$node_v[i]]
+    predict$a_uv[i] <- g.mat[predict$node_u[i], predict$node_v[i]]
+  }
+  
+  return(predict)
+}
+```
+
+### ERGM models without covariates
+
+```{r ergm}
+# Consider only the structural attributes of the network using triangles and kstars
+ergm_model1 <- ergm(formula(network ~ edges + triangles + kstar(2)), estimate="MPLE")
+summary(ergm_model1) # AIC: 3710  BIC: 3730
+
+# Model performance
+ergm_predict1 <- create_table(ergm_model1)
+head(ergm_predict1, n=10)
+mean(ergm_predict1$p_uv_hat[c(1:10)]) # 0.8212015
+mean(ergm_predict1$p_uv[c(1:10)]) # 0.5025497
+
+# Replace triangles with GWESP
+ergm_model2 <- ergm(formula(network ~ edges + gwesp(1, fixed=TRUE) + kstar(2)), estimate="MPLE")
+summary(ergm_model2) # 3762  BIC: 3781 Optimal at gamma=1
+
+# Model performance
+ergm_predict2 <- create_table(ergm_model2)
+head(ergm_predict2, n=10)
+mean(ergm_predict2$p_uv_hat[c(1:10)]) # 0.6556686
+mean(ergm_predict2$p_uv[c(1:10)]) # 0.5404345
+
+# Replace kstars with GWD
+ergm_model3 <- ergm(formula(network ~ edges + gwesp(1, fixed=TRUE) + gwdegree(4, fixed=TRUE)), estimate="MPLE")
+summary(ergm_model3) # AIC: 3748  BIC: 3767 Optimal at gamma=4 for gwdegree
+
+# Model performance
+ergm_predict3 <- create_table(ergm_model3)
+head(ergm_predict3, n=10)
+mean(ergm_predict3$p_uv_hat[c(1:10)]) # 0.6242587
+mean(ergm_predict3$p_uv[c(1:10)]) # 0.5404345
+
+# Remove preferential attachment structural attribute
+ergm_model4 <- ergm(formula(network ~ edges + gwesp(3.5, fixed=TRUE)), estimate="MPLE")
+summary(ergm_model4) # AIC: 3722  BIC: 3735 Optimal at gamma=3.5 for gwdegree
+
+# Model performance
+ergm_predict4 <- create_table(ergm_model4)
+head(ergm_predict4, n=10)
+mean(ergm_predict4$p_uv_hat[c(1:10)]) # 0.8215256
+mean(ergm_predict4$p_uv[c(1:10)]) # 0.514194
+```
+
+### Logistic models
+
+```{r logistic}
+# Incorporate all attributes and homophily features
+logistic_model1 <- ergm(formula(network ~ edges + nodemain("x") + nodemain("y") + absdiff("x") 
+                                + absdiff("y") + absdiff("x", pow=2) + absdiff("y", pow=2)))
+summary(logistic_model1) # AIC: 3427  BIC: 3472
+
+# Model performance
+logistic_predict1 <- create_table(logistic_model1)
+head(logistic_predict1, n=10)
+mean(logistic_predict1$p_uv_hat[c(1:10)]) # 0.8824964
+mean(logistic_predict1$p_uv[c(1:10)]) # 0.7671512
+
+# Backward elimination - remove absdiff2.x
+logistic_model2 <- ergm(formula(network ~ edges + nodemain("x") + nodemain("y") + absdiff("x")
+                                + absdiff("y")  + absdiff("y", pow=2)))
+summary(logistic_model2) # AIC: 3425  BIC: 3464 
+
+# Model performance
+logistic_predict2 <- create_table(logistic_model2)
+head(logistic_predict2, n=10)
+mean(logistic_predict2$p_uv_hat[c(1:10)]) # 0.8805818
+mean(logistic_predict2$p_uv[c(1:10)]) # 0.7671512
+
+# Backward elimination - remove absdiff.y
+logistic_model3 <- ergm(formula(network ~ edges + nodemain("x") + nodemain("y") + absdiff("x")
+                                + absdiff("y", pow=2)))
+summary(logistic_model3) # AIC: 3424  BIC: 3456
+
+# Model performance
+logistic_predict3 <- create_table(logistic_model3)
+head(logistic_predict3, n=10)
+mean(logistic_predict3$p_uv_hat[c(1:10)]) # 0.8878088
+mean(logistic_predict3$p_uv[c(1:10)]) # 0.7674682
+
+# Backward elimination - remove nodecov.x
+logistic_model4 <- ergm(formula(network ~ edges + nodemain("y") + absdiff("x") + absdiff("y", pow=2)))
+summary(logistic_model4) # AIC: 3425  BIC: 3451
+
+# Model performance
+logistic_predict4 <- create_table(logistic_model4)
+head(logistic_predict4, n=10)
+mean(logistic_predict4$p_uv_hat[c(1:10)]) # 0.8778212
+mean(logistic_predict4$p_uv[c(1:10)]) # 0.7762505
+```
+
+### ERGM models with covariates
+
+```{r combine}
+# Consider both network structure and nodal attributes
+combi_model1 <- ergm(formula(network ~ edges + nodemain("y") + absdiff("x") + absdiff("y", pow=2) 
+                            + gwesp(1, fixed=TRUE) + gwdegree(1, fixed=TRUE)), estimate="MPLE")
+summary(combi_model1) # AIC: 3418  BIC: 3457 Optimal at gamma=1 for gwdegree and gwesp
+
+# Model performance
+combi_predict1 <- create_table(combi_model1)
+head(combi_predict1, n=10)
+mean(combi_predict1$p_uv_hat[c(1:10)]) # 0.87422
+mean(combi_predict1$p_uv[c(1:10)]) # 0.7650666
+
+# Remove preferential attachment structural attribute
+combi_model2 <- ergm(formula(network ~ edges + nodemain("y") + absdiff("x") + absdiff("y", pow=2) 
+                            + gwesp(1, fixed=TRUE)), estimate="MPLE")
+summary(combi_model2) # AIC: 3425  BIC: 3458 Optimal at gamma=4 for gwdegree
+
+# Model performance
+combi_predict2 <- create_table(combi_model2)
+head(combi_predict2, n=10)
+mean(combi_predict2$p_uv_hat[c(1:10)]) # 0.8705917
+mean(combi_predict2$p_uv[c(1:10)]) # 0.7765287
+```
